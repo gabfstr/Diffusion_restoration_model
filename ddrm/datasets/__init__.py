@@ -5,6 +5,7 @@ import torchvision.transforms as transforms
 import torchvision.transforms.functional as F
 from datasets.celeba import CelebA
 from datasets.lsun import LSUN
+from datasets.BSD import DeblurDataset
 from torch.utils.data import Subset
 import numpy as np
 import torchvision
@@ -183,6 +184,16 @@ def get_dataset(args, config):
                 transforms.ToTensor()])
             )
             test_dataset = dataset
+
+    # Reproduce the previous steps for the BSD dataset
+    elif config.data.dataset == "BSD":
+        # path ?
+        train_path = os.path.join("../BSD", "BSD_1ms8ms","train")
+        test_path = os.path.join("../BSD","BSD_1ms8ms","test")
+        print("Loading path : ", train_path)
+        dataset = DeblurDataset(train_path, crop_size=(config.data.image_size,config.data.image_size), flip=config.data.random_flip, centralize=config.data.centralize, normalize=config.data.normalize)
+        test_dataset = DeblurDataset(test_path, crop_size=(config.data.image_size,config.data.image_size), flip=config.data.random_flip, centralize=config.data.centralize, normalize=config.data.normalize)
+
     else:
         dataset, test_dataset = None, None
 

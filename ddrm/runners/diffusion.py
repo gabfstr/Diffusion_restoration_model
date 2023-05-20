@@ -77,7 +77,7 @@ class Diffusion(object):
         alphas = 1.0 - betas
         alphas_cumprod = alphas.cumprod(dim=0)
         alphas_cumprod_prev = torch.cat(
-            [torch.ones(1).to(device), alphas_cumprod[:-1]], dim=0
+            [torch.ones(1).to(self.device), alphas_cumprod[:-1]], dim=0
         )
         self.alphas_cumprod_prev = alphas_cumprod_prev
         posterior_variance = (
@@ -101,9 +101,14 @@ class Diffusion(object):
                 name = f"lsun_{self.config.data.category}"
             elif self.config.data.dataset == 'CelebA_HQ':
                 name = 'celeba_hq'
+            elif self.config.data.dataset == 'BSD':
+                name = 'bsd'
             else:
                 raise ValueError
-            if name != 'celeba_hq':
+            if name == 'bsd':
+                ckpt = get_ckpt_path(f"ema_lsun_bedroom", prefix=self.args.exp)
+                print("Loading checkpoint {}".format(ckpt))
+            elif name != 'celeba_hq':
                 ckpt = get_ckpt_path(f"ema_{name}", prefix=self.args.exp)
                 print("Loading checkpoint {}".format(ckpt))
             elif name == 'celeba_hq':
@@ -186,10 +191,16 @@ class Diffusion(object):
 
         g = torch.Generator()
         g.manual_seed(args.seed)
+        
+        if config.data.dataset == 'BSD':
+            random_order = False
+        else:
+            random_order = True
+        
         val_loader = data.DataLoader(
             test_dataset,
             batch_size=config.sampling.batch_size,
-            shuffle=True,
+            shuffle=random_order,
             num_workers=config.data.num_workers,
             worker_init_fn=seed_worker,
             generator=g,
@@ -264,37 +275,78 @@ class Diffusion(object):
             H_funcs = SuperResolution(config.data.channels, config.data.image_size, blur_by, self.device)
         elif deg == 'color':
             from functions.svd_replacement import Colorization
-            H_funcs = Colorization(config.data.image_size, self.device)
+            H_funcs = Colorization(config.data.image_size, self.device)    
+        elif deg == 'non_uniform_deblur':
+            from functions.svd_replacement import Deblurring2D, NonUniformDeblurring
+            from kernel_extractor import get_blur_kernel, low_rank_approx , combine_kernels_threshold      
         else:
             print("ERROR: degradation type not supported")
             quit()
-        args.sigma_0 = 2 * args.sigma_0 #to account for scaling to [-1,1]
+        
+        if config.data.rescaled:
+            args.sigma_0 = 2 * args.sigma_0 #to account for scaling to [-1,1]
         sigma_0 = args.sigma_0
         
         print(f'Start from {args.subset_start}')
         idx_init = args.subset_start
         idx_so_far = args.subset_start
         avg_psnr = 0.0
-        pbar = tqdm.tqdm(val_loader)
-        for x_orig, classes in pbar:
+        pbar = val_loader
+        count_batch=1
+        for x_orig, y_0 in pbar:
+            
+            print("\nLoading batch ", count_batch, " of ", len(val_loader))
+            count_batch+=1
+
             x_orig = x_orig.to(self.device)
-            x_orig = data_transform(self.config, x_orig)
+            
+            
+            if deg == 'non_uniform_deblur' :
+                y_0 = y_0.to(self.device)
+                
 
-            y_0 = H_funcs.H(x_orig)
-            y_0 = y_0 + sigma_0 * torch.randn_like(y_0)
+                H_funcs_list = []
+                for i in range(y_0.shape[0]) :
 
-            pinv_y_0 = H_funcs.H_pinv(y_0).view(y_0.shape[0], config.data.channels, self.config.data.image_size, self.config.data.image_size)
-            if deg[:6] == 'deblur': pinv_y_0 = y_0.view(y_0.shape[0], config.data.channels, self.config.data.image_size, self.config.data.image_size)
-            elif deg == 'color': pinv_y_0 = y_0.view(y_0.shape[0], 1, self.config.data.image_size, self.config.data.image_size).repeat(1, 3, 1, 1)
-            elif deg[:3] == 'inp': pinv_y_0 += H_funcs.H_pinv(H_funcs.H(torch.ones_like(pinv_y_0))).reshape(*pinv_y_0.shape) - 1
+                    # y0 is [1 1 c h w]                    
+                    kernels, masks = get_blur_kernel(y_0[i], "../NonUniformBlurKernelEstimation/models/TwoHeads.pkl")
+                    
+                    # use single kernel, thresholding style
+                    one_kernel = combine_kernels_threshold(kernels, masks, threshold=2.5)
+                    # Compute svd to get a lower rank approximation and separate kernel
+                    _,kernel1,kernel2 =low_rank_approx(one_kernel,rank=1)
 
-            for i in range(len(pinv_y_0)):
-                tvu.save_image(
-                    inverse_data_transform(config, pinv_y_0[i]), os.path.join(self.args.image_folder, f"y0_{idx_so_far + i}.png")
-                )
-                tvu.save_image(
-                    inverse_data_transform(config, x_orig[i]), os.path.join(self.args.image_folder, f"orig_{idx_so_far + i}.png")
-                )
+
+                    # Compute H for 2d separable convolution kernel
+                    H_funcs_list.append(Deblurring2D(kernel1 / kernel1.sum(), kernel2 / kernel2.sum(), config.data.channels, self.config.data.image_size, self.device))
+
+                    for i in range(y_0.shape[0]):
+                        tvu.save_image(
+                            inverse_data_transform(config, y_0[i,0]), os.path.join(self.args.image_folder, f"y0_{idx_so_far + i}.png")
+                        )
+                        tvu.save_image(
+                            inverse_data_transform(config, x_orig[i]), os.path.join(self.args.image_folder, f"orig_{idx_so_far + i}.png")
+                        )
+
+            
+            else :
+                # Base DDRM
+
+                y_0 = H_funcs.H(x_orig)
+                y_0 = y_0 + sigma_0 * torch.randn_like(y_0)
+
+                pinv_y_0 = H_funcs.H_pinv(y_0).view(y_0.shape[0], config.data.channels, self.config.data.image_size, self.config.data.image_size)
+                if deg[:6] == 'deblur': pinv_y_0 = y_0.view(y_0.shape[0], config.data.channels, self.config.data.image_size, self.config.data.image_size)
+                elif deg == 'color': pinv_y_0 = y_0.view(y_0.shape[0], 1, self.config.data.image_size, self.config.data.image_size).repeat(1, 3, 1, 1)
+                elif deg[:3] == 'inp': pinv_y_0 += H_funcs.H_pinv(H_funcs.H(torch.ones_like(pinv_y_0))).reshape(*pinv_y_0.shape) - 1
+
+                for i in range(len(pinv_y_0)):
+                    tvu.save_image(
+                        inverse_data_transform(config, pinv_y_0[i]), os.path.join(self.args.image_folder, f"y0_{idx_so_far + i}.png")
+                    )
+                    tvu.save_image(
+                        inverse_data_transform(config, x_orig[i]), os.path.join(self.args.image_folder, f"orig_{idx_so_far + i}.png")
+                    )
 
             ##Begin DDIM
             x = torch.randn(
@@ -306,11 +358,44 @@ class Diffusion(object):
             )
 
             # NOTE: This means that we are producing each predicted x0, not x_{t-1} at timestep t.
-            with torch.no_grad():
-                x, _ = self.sample_image(x, model, H_funcs, y_0, sigma_0, last=False, cls_fn=cls_fn, classes=classes)
+            if deg == 'non_uniform_deblur' :
+                
+                with torch.no_grad():
+                    x_l=[]
+                    for i in range(y_0.shape[0]):
+                        y_0_i = y_0[i].unsqueeze(0).view(1,-1)
+                        
+                        # ###########
+                        # sigma = 20
+                        # pdf = lambda x: torch.exp(torch.Tensor([-0.5 * (x/sigma)**2]))
+                        # kernel2 = torch.Tensor([pdf(-4), pdf(-3), pdf(-2), pdf(-1), pdf(0), pdf(1), pdf(2), pdf(3), pdf(4)]).to(self.device)
+                        # sigma = 1
+                        # pdf = lambda x: torch.exp(torch.Tensor([-0.5 * (x/sigma)**2]))
+                        # kernel1 = torch.Tensor([pdf(-4), pdf(-3), pdf(-2), pdf(-1), pdf(0), pdf(1), pdf(2), pdf(3), pdf(4)]).to(self.device)
+                        # H_test = Deblurring2D(kernel1 / kernel1.sum(), kernel2 / kernel2.sum(), config.data.channels, self.config.data.image_size, self.device)
+                        # ###########
 
-            x = [inverse_data_transform(config, y) for y in x]
-
+                        # Execute diffusion
+                        xs, _ = self.sample_image(x[i].unsqueeze(0), model, H_funcs_list[i] , y_0_i, sigma_0, last=False, cls_fn=cls_fn, classes=None)
+                        
+                        # get results in the form of list (21) of list (21) of tensors (bs,3,64,64)
+                        if i==0:
+                            x_l=xs
+                        else:
+                            # concat on the batch axis
+                            for y in x_l:
+                                for res in y :
+                                    res=torch.cat((res,xs),dim=0)
+                        
+            else :
+                with torch.no_grad():
+                    x_l, _ = self.sample_image(x, model, H_funcs, y_0, sigma_0, last=False, cls_fn=cls_fn, classes=None)
+                    
+                    raise Exception("test")
+    
+            x = [inverse_data_transform(config, y) for y in x_l]
+            
+            print("Saving images at path ", self.args.image_folder)
             for i in [-1]: #range(len(x)):
                 for j in range(x[i].size(0)):
                     tvu.save_image(
@@ -324,16 +409,18 @@ class Diffusion(object):
 
             idx_so_far += y_0.shape[0]
 
-            pbar.set_description("PSNR: %.2f" % (avg_psnr / (idx_so_far - idx_init)))
+            print("Batch PSNR: %.2f" % (avg_psnr / (idx_so_far - idx_init)))
 
         avg_psnr = avg_psnr / (idx_so_far - idx_init)
         print("Total Average PSNR: %.2f" % avg_psnr)
         print("Number of samples: %d" % (idx_so_far - idx_init))
 
     def sample_image(self, x, model, H_funcs, y_0, sigma_0, last=True, cls_fn=None, classes=None):
+        # x is [batch_size, channels, height, width]
+        # y_0 is [batch_size, channels * height * width]
+
         skip = self.num_timesteps // self.args.timesteps
         seq = range(0, self.num_timesteps, skip)
-        
         x = efficient_generalized_steps(x, seq, model, self.betas, H_funcs, y_0, sigma_0, \
             etaB=self.args.etaB, etaA=self.args.eta, etaC=self.args.eta, cls_fn=cls_fn, classes=classes)
         if last:

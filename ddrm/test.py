@@ -2,12 +2,18 @@ import argparse
 import traceback
 import shutil
 import logging
+import tqdm
 import yaml
 import sys
 import os
 import torch
 import numpy as np
 import torch.utils.tensorboard as tb
+import random
+
+import torch.utils.data as data
+from datasets import get_dataset
+
 
 from runners.diffusion import Diffusion
 
@@ -39,12 +45,6 @@ def parse_args_and_config():
         type=str,
         default="info",
         help="Verbose level: info | debug | warning | critical",
-    )
-    parser.add_argument(
-        "--plot",
-        type=bool,
-        default=False,
-        help="Whether to plot the sharp, blurred and deblurred pictures at inference time: True | False (Default)",
     )
     parser.add_argument(
         "--sample",
@@ -166,8 +166,35 @@ def main():
     logging.info("Exp comment = {}".format(args.comment))
 
     try:
-        runner = Diffusion(args, config)
-        runner.sample()
+        dataset, test_dataset = get_dataset(args, config)
+        
+        print("Dataset loaded, W&H: ", dataset.W, dataset.H)
+
+        def seed_worker(worker_id):
+            worker_seed = args.seed % 2**32
+            np.random.seed(worker_seed)
+            random.seed(worker_seed)
+
+
+        g = torch.Generator()
+        g.manual_seed(args.seed)
+        val_loader = data.DataLoader(
+            dataset,
+            batch_size=config.sampling.batch_size,
+            shuffle=True,
+            num_workers=config.data.num_workers,
+            worker_init_fn=seed_worker,
+            generator=g,
+        )
+
+        pbar = val_loader
+
+        print("Val loader loaded, length : ", len(val_loader))
+        dataiter=iter(pbar)
+        x, y = dataiter.next()
+        print("x shape: ", x.shape)
+        print("y shape: ", y.shape)
+
     except Exception:
         logging.error(traceback.format_exc())
 
