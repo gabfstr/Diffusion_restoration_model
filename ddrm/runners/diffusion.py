@@ -8,7 +8,7 @@ import tqdm
 import torch
 import torch.utils.data as data
 
-from models.diffusion import Model
+from models.U_net import Model
 from datasets import get_dataset, data_transform, inverse_data_transform
 from functions.ckpt_util import get_ckpt_path, download
 from functions.denoising import efficient_generalized_steps
@@ -277,7 +277,11 @@ class Diffusion(object):
         elif deg == 'color':
             from functions.svd_replacement import Colorization
             H_funcs = Colorization(config.data.image_size, self.device)    
-        elif deg == 'non_uniform_deblur':
+        elif deg == 'non_uniform_deblur' or deg == 'non_uniform_deblur_full':
+            if deg == 'non_uniform_deblur_full':
+                import torch.nn.functional as F
+                from torchvision.transforms import RandomCrop
+                import torchvision.transforms.functional as TF
             from functions.svd_replacement import Deblurring2D, NonUniformDeblurring
             from kernel_extractor import get_blur_kernel, low_rank_approx , combine_kernels_threshold  
             
@@ -310,26 +314,23 @@ class Diffusion(object):
             x_orig = x_orig.to(self.device)
             bs, n_frames, c, h, w = x_orig.shape
             
-            if deg == 'non_uniform_deblur' :
+            if deg == 'non_uniform_deblur' or deg == 'non_uniform_deblur_full':
                 y_0 = y_0.to(self.device)
                 
                 x_orig = x_orig.view(bs*n_frames, c, h, w)
                 y_0 = y_0.view(bs*n_frames, c, h, w)
                 #y_0 is [b c h w]
                 
-                import torch.nn.functional as F
-                from torchvision.transforms import RandomCrop
-                import torchvision.transforms.functional as TF
-                
-                # Bilinearly crop image to 64x64 and resize image to 32x32 :
-                i, j, h, w = RandomCrop.get_params(
-                    y_0, output_size=(96, 96))
-                y_0 = TF.crop(y_0, i, j, h, w)
-                x_orig = TF.crop(x_orig, i, j, h, w)
-                
-                
-                y_0 = F.interpolate(y_0, size=(64,64), mode='bilinear', align_corners=False)
-                x_orig= F.interpolate(x_orig, size=(64,64), mode='bilinear', align_corners=False)
+                if deg == 'non_uniform_deblur_full':
+                    # Bilinearly crop image to 64x64 and resize image to 32x32 :
+                    i, j, h, w = RandomCrop.get_params(
+                        y_0, output_size=(96, 96))
+                    y_0 = TF.crop(y_0, i, j, h, w)
+                    x_orig = TF.crop(x_orig, i, j, h, w)
+                    
+                    
+                    y_0 = F.interpolate(y_0, size=(64,64), mode='bilinear', align_corners=False)
+                    x_orig= F.interpolate(x_orig, size=(64,64), mode='bilinear', align_corners=False)
                 
                 print("final y_0 shape : ", y_0.shape)
                 print("final x_orig shape : ", x_orig.shape)
@@ -388,36 +389,40 @@ class Diffusion(object):
             )
 
             # NOTE: This means that we are producing each predicted x0, not x_{t-1} at timestep t.
-            if deg == 'non_uniform_deblur' :
-                ##Begin DDIM
-                x = torch.randn(
-                    y_0.shape[0],
-                    config.data.channels,
-                    y_0.shape[2],
-                    y_0.shape[3],
-                    device=self.device,
-                )
+            if deg == 'non_uniform_deblur' or deg == 'non_uniform_deblur_full' :
+                if deg == 'non_uniform_deblur_full':
+                    ##Begin DDIM
+                    x = torch.randn(
+                        y_0.shape[0],
+                        config.data.channels,
+                        y_0.shape[2],
+                        y_0.shape[3],
+                        device=self.device,
+                    )
+                
+                
                 with torch.no_grad():
                     x_l=[]
                     for i in range(y_0.shape[0]):
                         y_0_i = y_0[i].unsqueeze(0).view(1,-1)
                         
-                        
+                        # Estimate kernels and masks
                         kernels, masks = get_blur_kernel(y_0[i], "../NonUniformBlurKernelEstimation/models/TwoHeads.pkl")
-                    
-                        H_funcs_i = NonUniformDeblurring(kernels[i], masks[i], config.data.channels, y_0.shape[-1], self.device)
                         
-                        # THRESHOLDING SINGLE KERNEL
-####################################################
-                        # use single kernel, thresholding style
-                        # one_kernel = combine_kernels_threshold(kernels, masks, threshold=2.5)
-                        # Compute svd to get a lower rank approximation and separate kernel
-                        # _,kernel1,kernel2 =low_rank_approx(one_kernel,rank=1)
+                        
+                        if deg == 'non_uniform_deblur_full':
+                            H_funcs_i = NonUniformDeblurring(kernels[i], masks[i], config.data.channels, y_0.shape[-1], self.device)
+                        
+                        
+                        # THRESHOLDING SINGLE KERNEL        
+                        else :
+                            # use single kernel, thresholding style
+                            one_kernel = combine_kernels_threshold(kernels, masks, threshold=2.5)
+                            # Compute svd to get a lower rank approximation and separate kernel
+                            _ ,kernel1, kernel2 =low_rank_approx(one_kernel,rank=1)
 
-
-                        # Compute H for 2d separable convolution kernel
-                        # H_funcs_i = (Deblurring2D(kernel1 / kernel1.sum(), kernel2 / kernel2.sum(), config.data.channels, self.config.data.image_size, self.device)
-####################################################
+                            # Compute H for 2d separable convolution kernel
+                            H_funcs_i = (Deblurring2D(kernel1 / kernel1.sum(), kernel2 / kernel2.sum(), config.data.channels, self.config.data.image_size, self.device))
 
 
                         # 2D deblurring kernel
@@ -461,7 +466,8 @@ class Diffusion(object):
     
             x = [inverse_data_transform(config, y) for y in x_l]
             
-            print("Saving images at path ", self.args.image_folder)
+            if args.save_images:
+                print("Saving images at path ", self.args.image_folder)
             for i in [-1]: #range(len(x)):
                 for j in range(x[i].size(0)):
                     if args.save_images:
