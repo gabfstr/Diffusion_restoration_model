@@ -196,8 +196,9 @@ class Diffusion(object):
             random_order = False
         else:
             random_order = True
-        
+        #print('WATCH OUT I CHANGED SOMETHING (SHANE)')
         val_loader = data.DataLoader(
+            #torch.utils.data.ConcatDataset([test_dataset, test_dataset]),
             test_dataset,
             batch_size=config.sampling.batch_size,
             shuffle=random_order,
@@ -278,7 +279,15 @@ class Diffusion(object):
             H_funcs = Colorization(config.data.image_size, self.device)    
         elif deg == 'non_uniform_deblur':
             from functions.svd_replacement import Deblurring2D, NonUniformDeblurring
-            from kernel_extractor import get_blur_kernel, low_rank_approx , combine_kernels_threshold      
+            from kernel_extractor import get_blur_kernel, low_rank_approx , combine_kernels_threshold  
+            
+        elif deg == 'deblur_shane':
+            from functions.svd_replacement import Deblurring
+            sigma = 10
+            pdf = lambda x: torch.exp(torch.Tensor([-0.5 * (x/sigma)**2]))
+            kernel = torch.Tensor([pdf(-2), pdf(-1), pdf(0), pdf(1), pdf(2)]).to(self.device)
+            H_funcs = Deblurring(kernel / kernel.sum(), config.data.channels, self.config.data.image_size, self.device) 
+            
         else:
             print("ERROR: degradation type not supported")
             quit()
@@ -299,36 +308,56 @@ class Diffusion(object):
             count_batch+=1
 
             x_orig = x_orig.to(self.device)
-            
+            bs, n_frames, c, h, w = x_orig.shape
             
             if deg == 'non_uniform_deblur' :
                 y_0 = y_0.to(self.device)
                 
+                x_orig = x_orig.view(bs*n_frames, c, h, w)
+                y_0 = y_0.view(bs*n_frames, c, h, w)
+                #y_0 is [b c h w]
+                
+                import torch.nn.functional as F
+                from torchvision.transforms import RandomCrop
+                import torchvision.transforms.functional as TF
+                
+                # Bilinearly crop image to 64x64 and resize image to 32x32 :
+                i, j, h, w = RandomCrop.get_params(
+                    y_0, output_size=(96, 96))
+                y_0 = TF.crop(y_0, i, j, h, w)
+                x_orig = TF.crop(x_orig, i, j, h, w)
+                
+                
+                y_0 = F.interpolate(y_0, size=(64,64), mode='bilinear', align_corners=False)
+                x_orig= F.interpolate(x_orig, size=(64,64), mode='bilinear', align_corners=False)
+                
+                print("final y_0 shape : ", y_0.shape)
+                print("final x_orig shape : ", x_orig.shape)
 
-                H_funcs_list = []
-                for i in range(y_0.shape[0]) :
-
-                    # y0 is [1 1 c h w]                    
-                    kernels, masks = get_blur_kernel(y_0[i], "../NonUniformBlurKernelEstimation/models/TwoHeads.pkl")
-                    
-                    # use single kernel, thresholding style
-                    one_kernel = combine_kernels_threshold(kernels, masks, threshold=2.5)
-                    # Compute svd to get a lower rank approximation and separate kernel
-                    _,kernel1,kernel2 =low_rank_approx(one_kernel,rank=1)
-
-
-                    # Compute H for 2d separable convolution kernel
-                    H_funcs_list.append(Deblurring2D(kernel1 / kernel1.sum(), kernel2 / kernel2.sum(), config.data.channels, self.config.data.image_size, self.device))
-
+                if args.save_images :
                     for i in range(y_0.shape[0]):
                         tvu.save_image(
-                            inverse_data_transform(config, y_0[i,0]), os.path.join(self.args.image_folder, f"y0_{idx_so_far + i}.png")
+                            inverse_data_transform(config, y_0[i]), os.path.join(self.args.image_folder, f"y0_{idx_so_far + i}.png")
                         )
                         tvu.save_image(
                             inverse_data_transform(config, x_orig[i]), os.path.join(self.args.image_folder, f"orig_{idx_so_far + i}.png")
                         )
 
-            
+            elif deg == 'deblur_shane':
+                new_y_0 = torch.empty(2, 1, 4, 256, 256)
+                count = 0
+                for image in x_orig:
+                    print('Image size', image.size())
+                    channel = image[0]
+                    print('NEWImg size', image.size())
+                    new_y_0[count][0] = torch.stack((channel[0], channel[1],channel[2],channel[2]))
+                    count+=1
+                
+                y_0 = H_funcs.H(new_y_0)#(x_orig)
+                y_0 = y_0 + sigma_0 * torch.randn_like(y_0)
+                pinv_y_0 = y_0.view(y_0.shape[0], config.data.channels, self.config.data.image_size, self.config.data.image_size)
+
+
             else :
                 # Base DDRM
 
@@ -339,14 +368,15 @@ class Diffusion(object):
                 if deg[:6] == 'deblur': pinv_y_0 = y_0.view(y_0.shape[0], config.data.channels, self.config.data.image_size, self.config.data.image_size)
                 elif deg == 'color': pinv_y_0 = y_0.view(y_0.shape[0], 1, self.config.data.image_size, self.config.data.image_size).repeat(1, 3, 1, 1)
                 elif deg[:3] == 'inp': pinv_y_0 += H_funcs.H_pinv(H_funcs.H(torch.ones_like(pinv_y_0))).reshape(*pinv_y_0.shape) - 1
-
-                for i in range(len(pinv_y_0)):
-                    tvu.save_image(
-                        inverse_data_transform(config, pinv_y_0[i]), os.path.join(self.args.image_folder, f"y0_{idx_so_far + i}.png")
-                    )
-                    tvu.save_image(
-                        inverse_data_transform(config, x_orig[i]), os.path.join(self.args.image_folder, f"orig_{idx_so_far + i}.png")
-                    )
+                
+                if args.save_images:
+                    for i in range(len(pinv_y_0)):
+                        tvu.save_image(
+                            inverse_data_transform(config, pinv_y_0[i]), os.path.join(self.args.image_folder, f"y0_{idx_so_far + i}.png")
+                        )
+                        tvu.save_image(
+                            inverse_data_transform(config, x_orig[i]), os.path.join(self.args.image_folder, f"orig_{idx_so_far + i}.png")
+                        )
 
             ##Begin DDIM
             x = torch.randn(
@@ -359,12 +389,38 @@ class Diffusion(object):
 
             # NOTE: This means that we are producing each predicted x0, not x_{t-1} at timestep t.
             if deg == 'non_uniform_deblur' :
-                
+                ##Begin DDIM
+                x = torch.randn(
+                    y_0.shape[0],
+                    config.data.channels,
+                    y_0.shape[2],
+                    y_0.shape[3],
+                    device=self.device,
+                )
                 with torch.no_grad():
                     x_l=[]
                     for i in range(y_0.shape[0]):
                         y_0_i = y_0[i].unsqueeze(0).view(1,-1)
                         
+                        
+                        kernels, masks = get_blur_kernel(y_0[i], "../NonUniformBlurKernelEstimation/models/TwoHeads.pkl")
+                    
+                        H_funcs_i = NonUniformDeblurring(kernels[i], masks[i], config.data.channels, y_0.shape[-1], self.device)
+                        
+                        # THRESHOLDING SINGLE KERNEL
+####################################################
+                        # use single kernel, thresholding style
+                        # one_kernel = combine_kernels_threshold(kernels, masks, threshold=2.5)
+                        # Compute svd to get a lower rank approximation and separate kernel
+                        # _,kernel1,kernel2 =low_rank_approx(one_kernel,rank=1)
+
+
+                        # Compute H for 2d separable convolution kernel
+                        # H_funcs_i = (Deblurring2D(kernel1 / kernel1.sum(), kernel2 / kernel2.sum(), config.data.channels, self.config.data.image_size, self.device)
+####################################################
+
+
+                        # 2D deblurring kernel
                         # ###########
                         # sigma = 20
                         # pdf = lambda x: torch.exp(torch.Tensor([-0.5 * (x/sigma)**2]))
@@ -375,8 +431,11 @@ class Diffusion(object):
                         # H_test = Deblurring2D(kernel1 / kernel1.sum(), kernel2 / kernel2.sum(), config.data.channels, self.config.data.image_size, self.device)
                         # ###########
 
+                        print("Executing Diffusion :")
                         # Execute diffusion
-                        xs, _ = self.sample_image(x[i].unsqueeze(0), model, H_funcs_list[i] , y_0_i, sigma_0, last=False, cls_fn=cls_fn, classes=None)
+                        xs, _ = self.sample_image(x[i].unsqueeze(0), model, H_funcs_i , y_0_i, sigma_0, last=False, cls_fn=cls_fn, classes=None)
+                        
+                        del H_funcs_i
                         
                         # get results in the form of list (21) of list (21) of tensors (bs,3,64,64)
                         if i==0:
@@ -387,20 +446,28 @@ class Diffusion(object):
                                 for res in y :
                                     res=torch.cat((res,xs),dim=0)
                         
+            elif deg == 'deblur_shane' :
+
+                # Do your thing abut Diffusion here
+                print("shane part")
+                with torch.no_grad():
+                    x_l, _ = self.sample_image(x, model, H_funcs, y_0, sigma_0, last=False, cls_fn=cls_fn, classes=None)
+
+                
             else :
                 with torch.no_grad():
                     x_l, _ = self.sample_image(x, model, H_funcs, y_0, sigma_0, last=False, cls_fn=cls_fn, classes=None)
                     
-                    raise Exception("test")
     
             x = [inverse_data_transform(config, y) for y in x_l]
             
             print("Saving images at path ", self.args.image_folder)
             for i in [-1]: #range(len(x)):
                 for j in range(x[i].size(0)):
-                    tvu.save_image(
-                        x[i][j], os.path.join(self.args.image_folder, f"{idx_so_far + j}_{i}.png")
-                    )
+                    if args.save_images:
+                        tvu.save_image(
+                            x[i][j], os.path.join(self.args.image_folder, f"{idx_so_far + j}_{i}.png")
+                        )
                     if i == len(x)-1 or i == -1:
                         orig = inverse_data_transform(config, x_orig[j])
                         mse = torch.mean((x[i][j].to(self.device) - orig) ** 2)

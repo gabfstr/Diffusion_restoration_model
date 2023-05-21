@@ -1,4 +1,5 @@
 import torch
+from tqdm import tqdm
 from pynvml import *
 
 
@@ -469,12 +470,14 @@ class Deblurring(H_functions):
 # Non uniform deblurring
 class NonUniformDeblurring(H_functions):
     def mat_by_img(self, M, v):
-        return torch.matmul(M, v.reshape(v.shape[0] * self.channels, self.img_dim,
-                        self.img_dim)).reshape(v.shape[0], self.channels, M.shape[0], self.img_dim)
+        return torch.matmul(M, v.reshape(-1,              
+                            self.img_dim*self.img_dim ).permute(1,0)).permute(1,0).reshape(v.shape[0], -1)
+    
+    def mat_by_vec(self, M, v):
+        return torch.matmul(M, v.reshape(v.shape[0] * self.channels,              
+                            self.img_dim*self.img_dim ).permute(1,0)).permute(1,0).reshape(v.shape[0], self.channels, self.img_dim*self.img_dim)
 
-    def img_by_mat(self, v, M):
-        return torch.matmul(v.reshape(v.shape[0] * self.channels, self.img_dim,
-                        self.img_dim), M).reshape(v.shape[0], self.channels, self.img_dim, M.shape[1])
+   
 
     def __init__(self, kernels, masks, channels, img_dim, device, ZERO = 3e-2):
         self.img_dim = img_dim
@@ -484,6 +487,7 @@ class NonUniformDeblurring(H_functions):
         print("img_dim: ", img_dim)
         print("kernels shape: ", kernels.shape)
         print("masks shape: ", masks.shape)
+        print("Device is: ", device)
         # kernels must be [n_kernels, kernel_size]
         # masks must be [n_kernels, img_dim, img_dim]
         
@@ -495,60 +499,52 @@ class NonUniformDeblurring(H_functions):
         # print(f'total    : {info.total}')
         # print(f'free     : {info.free}')
         # print(f'used     : {info.used}')
-        H_small = torch.zeros(h_Y*w_Y,img_dim*img_dim, device=device)
-        for i in range(h_Y):
-            for j in range(w_Y):
-                for k in range(kernels.shape[0]):
-                    for l in range(kernels.shape[1]):
-                        for m in range(kernels.shape[2]):
-                            H_small[i*w_Y + j, (i+l)*img_dim + j + m] += kernels[k, l, m] * masks[k, i, j]
         
-        print("H_small shape: ", H_small.shape)
-        print(H_small)
-        #get the svd of the 1D conv
-        self.U_small, self.singulars_small, self.V_small = torch.svd(H_small, some=False)
+        print("Creating H_small :")
+        # Construct the convlution matrix
+        H = torch.zeros(img_dim*img_dim,img_dim*img_dim, device=device)
+        for i in tqdm(range(img_dim*img_dim)):
+            for l in range(kernels.shape[1]):
+                for m in range(kernels.shape[2]):
+                    for k in range(kernels.shape[0]):
+                        j_begin = i - kernels.shape[2]//2 - img_dim*kernels.shape[1]//2
+                        real_i = i // img_dim
+                        real_j = i % img_dim
+                        if real_i >=img_dim or real_j >= img_dim:
+                            print("i: ", i)
+                            print("real_i: ", real_i)
+                            print("real_j: ", real_j)
+                            continue
+                        if j_begin + m + l*img_dim >= 0 and j_begin + m + l*img_dim < img_dim*img_dim:
+                            H[i, j_begin + m + l*img_dim] += kernels[k, l, m] * masks[k, real_i, real_j]
+
+        print("H_small was created : ")
+        print("H_small shape: ", H.shape)
+
+        #get the svd of the 2D conv
+        self.U_mat, self._singulars, self.V_mat = torch.svd(H, some=False)
+        
+        del H
+        
+
         #ZERO = 3e-2
-        self.singulars_small[self.singulars_small < ZERO] = 0
-        #calculate the singular values of the big matrix
-        self._singulars = torch.matmul(self.singulars_small.reshape(img_dim, 1), self.singulars_small.reshape(1, img_dim)).reshape(img_dim**2)
+        self._singulars[self._singulars < ZERO] = 0
+        
         #sort the big matrix singulars and save the permutation
         self._singulars, self._perm = self._singulars.sort(descending=True) #, stable=True)
 
     def V(self, vec):
-        #invert the permutation
-        temp = torch.zeros(vec.shape[0], self.img_dim**2, self.channels, device=vec.device)
-        temp[:, self._perm, :] = vec.clone().reshape(vec.shape[0], self.img_dim**2, self.channels)
-        temp = temp.permute(0, 2, 1)
-        #multiply the image by V from the left and by V^T from the right
-        out = self.mat_by_img(self.V_small, temp)
-        out = self.img_by_mat(out, self.V_small.transpose(0, 1)).reshape(vec.shape[0], -1)
-        return out
+        return self.mat_by_img(self.V_mat, vec.clone())
 
     def Vt(self, vec):
-        #multiply the image by V^T from the left and by V from the right
-        temp = self.mat_by_img(self.V_small.transpose(0, 1), vec.clone())
-        temp = self.img_by_mat(temp, self.V_small).reshape(vec.shape[0], self.channels, -1)
-        #permute the entries according to the singular values
-        temp = temp[:, :, self._perm].permute(0, 2, 1)
-        return temp.reshape(vec.shape[0], -1)
+        return self.mat_by_img(self.V_mat.transpose(0,1), vec.clone())
+
 
     def U(self, vec):
-        #invert the permutation
-        temp = torch.zeros(vec.shape[0], self.img_dim**2, self.channels, device=vec.device)
-        temp[:, self._perm, :] = vec.clone().reshape(vec.shape[0], self.img_dim**2, self.channels)
-        temp = temp.permute(0, 2, 1)
-        #multiply the image by U from the left and by U^T from the right
-        out = self.mat_by_img(self.U_small, temp)
-        out = self.img_by_mat(out, self.U_small.transpose(0, 1)).reshape(vec.shape[0], -1)
-        return out
+        return self.mat_by_img(self.U_mat, vec.clone())
 
     def Ut(self, vec):
-        #multiply the image by U^T from the left and by U from the right
-        temp = self.mat_by_img(self.U_small.transpose(0, 1), vec.clone())
-        temp = self.img_by_mat(temp, self.U_small).reshape(vec.shape[0], self.channels, -1)
-        #permute the entries according to the singular values
-        temp = temp[:, :, self._perm].permute(0, 2, 1)
-        return temp.reshape(vec.shape[0], -1)
+        return self.mat_by_img(self.U_mat.transpose(0,1), vec.clone())
 
     def singulars(self):
         return self._singulars.repeat(1, 3).reshape(-1)
