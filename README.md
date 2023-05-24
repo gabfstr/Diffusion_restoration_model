@@ -14,6 +14,7 @@ This project was part of the MVA course on Generative models for images. Materia
 
 TO DO :
 
-- [] Installation guide
-- [] Colab Demo
-- [] Finish Readme
+- [x] Code
+- [ ] Installation guide
+- [ ] Colab Demo
+- [ ] Finish Readme
