@@ -2,13 +2,14 @@ import os
 import logging
 import time
 import glob
+import sys
 
 import numpy as np
 import tqdm
 import torch
 import torch.utils.data as data
 
-from models.U_net import Model
+from models.U_net import Model as unet_model
 from datasets import get_dataset, data_transform, inverse_data_transform
 from functions.ckpt_util import get_ckpt_path, download
 from functions.denoising import efficient_generalized_steps
@@ -93,7 +94,7 @@ class Diffusion(object):
     def sample(self):
         cls_fn = None
         if self.config.model.type == 'simple':    
-            model = Model(self.config)
+            model = unet_model(self.config)
             # This used the pretrained DDPM model, see https://github.com/pesser/pytorch_diffusion
             if self.config.data.dataset == "CIFAR10":
                 name = "cifar10"
@@ -105,7 +106,7 @@ class Diffusion(object):
                 name = 'bsd'
             else:
                 raise ValueError
-            if name == 'bsd':
+            if name == 'bsd':    
                 ckpt = get_ckpt_path(f"ema_lsun_bedroom", prefix=self.args.exp)
                 print("Loading checkpoint {}".format(ckpt))
             elif name != 'celeba_hq':
@@ -118,9 +119,12 @@ class Diffusion(object):
                     download('https://image-editing-test-12345.s3-us-west-2.amazonaws.com/checkpoints/celeba_hq.ckpt', ckpt)
             else:
                 raise ValueError
+                
             model.load_state_dict(torch.load(ckpt, map_location=self.device))
             model.to(self.device)
             model = torch.nn.DataParallel(model)
+        
+            
 
         elif self.config.model.type == 'openai':
             config_dict = vars(self.config.model)
@@ -196,9 +200,9 @@ class Diffusion(object):
             random_order = False
         else:
             random_order = True
-        #print('WATCH OUT I CHANGED SOMETHING (SHANE)')
+       
+
         val_loader = data.DataLoader(
-            #torch.utils.data.ConcatDataset([test_dataset, test_dataset]),
             test_dataset,
             batch_size=config.sampling.batch_size,
             shuffle=random_order,
@@ -255,7 +259,7 @@ class Diffusion(object):
         elif deg == 'deblur_uni':
             from functions.svd_replacement import Deblurring
             H_funcs = Deblurring(torch.Tensor([1/9] * 9).to(self.device), config.data.channels, self.config.data.image_size, self.device)
-        elif deg == 'deblur_gauss':
+        elif deg == 'deblur_gauss' or deg=='video_deblur':
             from functions.svd_replacement import Deblurring
             sigma = 10
             pdf = lambda x: torch.exp(torch.Tensor([-0.5 * (x/sigma)**2]))
@@ -270,6 +274,15 @@ class Diffusion(object):
             pdf = lambda x: torch.exp(torch.Tensor([-0.5 * (x/sigma)**2]))
             kernel1 = torch.Tensor([pdf(-4), pdf(-3), pdf(-2), pdf(-1), pdf(0), pdf(1), pdf(2), pdf(3), pdf(4)]).to(self.device)
             H_funcs = Deblurring2D(kernel1 / kernel1.sum(), kernel2 / kernel2.sum(), config.data.channels, self.config.data.image_size, self.device)
+        elif deg == 'deblur_aniso_motion':
+                from functions.svd_replacement import Deblurring2D
+                sigma = 20
+                pdf = lambda x: torch.exp(torch.Tensor([-0.5 * (x/sigma)**2]))
+                kernel2 = torch.Tensor([0. ,0. ,0. ,0. ,0.05 ,0.1 ,0.25 ,0.4 ,0.2 ,0.1 ,0.05 ,0. ,0. ,0. ,0.]).to(self.device)
+                sigma = 1
+                pdf = lambda x: torch.exp(torch.Tensor([-0.5 * (x/sigma)**2]))
+                kernel1 = torch.Tensor([0. ,0. ,0. ,0. ,0. ,0.1 ,0.2 ,0.4 ,0.2 ,0.1 ,0. ,0. ,0. ,0. ,0.]).to(self.device)
+                H_funcs = Deblurring2D(kernel1 / kernel1.sum(), kernel2 / kernel2.sum(), config.data.channels, self.config.data.image_size, self.device)
         elif deg[:2] == 'sr':
             blur_by = int(deg[2:])
             from functions.svd_replacement import SuperResolution
@@ -277,20 +290,20 @@ class Diffusion(object):
         elif deg == 'color':
             from functions.svd_replacement import Colorization
             H_funcs = Colorization(config.data.image_size, self.device)    
-        elif deg == 'non_uniform_deblur' or deg == 'non_uniform_deblur_full':
-            if deg == 'non_uniform_deblur_full':
-                import torch.nn.functional as F
-                from torchvision.transforms import RandomCrop
-                import torchvision.transforms.functional as TF
+        elif deg == 'non_uniform_deblur' or deg == 'non_uniform_deblur_full' or deg == 'video_deblur':
+            import torch.nn.functional as F
+            from torchvision.transforms import RandomCrop
+            import torchvision.transforms.functional as TF
+
             from functions.svd_replacement import Deblurring2D, NonUniformDeblurring
             from kernel_extractor import get_blur_kernel, low_rank_approx , combine_kernels_threshold  
             
-        elif deg == 'deblur_shane':
-            from functions.svd_replacement import Deblurring
-            sigma = 10
-            pdf = lambda x: torch.exp(torch.Tensor([-0.5 * (x/sigma)**2]))
-            kernel = torch.Tensor([pdf(-2), pdf(-1), pdf(0), pdf(1), pdf(2)]).to(self.device)
-            H_funcs = Deblurring(kernel / kernel.sum(), config.data.channels, self.config.data.image_size, self.device) 
+        # elif deg == 'video_deblur':
+        #     from functions.svd_replacement import Deblurring
+        #     sigma = 10
+        #     pdf = lambda x: torch.exp(torch.Tensor([-0.5 * (x/sigma)**2]))
+        #     kernel = torch.Tensor([pdf(-2), pdf(-1), pdf(0), pdf(1), pdf(2)]).to(self.device)
+        #     H_funcs = Deblurring(kernel / kernel.sum(), config.data.channels, self.config.data.image_size, self.device) 
             
         else:
             print("ERROR: degradation type not supported")
@@ -307,12 +320,13 @@ class Diffusion(object):
         pbar = val_loader
         count_batch=1
         for x_orig, y_0 in pbar:
-            
+
             print("\nLoading batch ", count_batch, " of ", len(val_loader))
             count_batch+=1
 
             x_orig = x_orig.to(self.device)
             bs, n_frames, c, h, w = x_orig.shape
+
             
             if deg == 'non_uniform_deblur' or deg == 'non_uniform_deblur_full':
                 y_0 = y_0.to(self.device)
@@ -344,21 +358,9 @@ class Diffusion(object):
                             inverse_data_transform(config, x_orig[i]), os.path.join(self.args.image_folder, f"orig_{idx_so_far + i}.png")
                         )
 
-            elif deg == 'deblur_shane':
-                new_y_0 = torch.empty(2, 1, 4, 256, 256)
-                count = 0
-                for image in x_orig:
-                    print('Image size', image.size())
-                    channel = image[0]
-                    print('NEWImg size', image.size())
-                    new_y_0[count][0] = torch.stack((channel[0], channel[1],channel[2],channel[2]))
-                    count+=1
+            elif deg == 'video_deblur':
+                y_0 = y_0.to(self.device)
                 
-                y_0 = H_funcs.H(new_y_0)#(x_orig)
-                y_0 = y_0 + sigma_0 * torch.randn_like(y_0)
-                pinv_y_0 = y_0.view(y_0.shape[0], config.data.channels, self.config.data.image_size, self.config.data.image_size)
-
-
             else :
                 # Base DDRM
 
@@ -389,7 +391,7 @@ class Diffusion(object):
             )
 
             # NOTE: This means that we are producing each predicted x0, not x_{t-1} at timestep t.
-            if deg == 'non_uniform_deblur' or deg == 'non_uniform_deblur_full' :
+            if deg == 'non_uniform_deblur' or deg == 'non_uniform_deblur_full':
                 if deg == 'non_uniform_deblur_full':
                     ##Begin DDIM
                     x = torch.randn(
@@ -451,10 +453,7 @@ class Diffusion(object):
                                 for res in y :
                                     res=torch.cat((res,xs),dim=0)
                         
-            elif deg == 'deblur_shane' :
-
-                # Do your thing abut Diffusion here
-                print("shane part")
+            elif deg == 'video_deblur':
                 with torch.no_grad():
                     x_l, _ = self.sample_image(x, model, H_funcs, y_0, sigma_0, last=False, cls_fn=cls_fn, classes=None)
 
