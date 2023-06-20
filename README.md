@@ -8,7 +8,7 @@ We wish to explore DDRM's limitations and bridge the gap towards solving them : 
 This project was part of the MVA course on Generative models for images. Materials from the course can be found [here](https://vdeborto.github.io/project/generative_modeling/)
 
 
-![kernelEstim](https://github.com/gabfstr/Diffusion_restoration_model/assets/88781950/eaf5ca3d-7b03-41a4-8f26-69fc2bbc89eb)
+![kernelEstim](https://github.com/gabfstr/Diffusion_restoration_model/blob/main/imgs/kernelEstim.png)
 
 
 
