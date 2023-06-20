@@ -16,5 +16,5 @@ TO DO :
 
 - [x] Code
 - [ ] Installation guide
-- [ ] Colab Demo
+- [ ] Demo Notebook
 - [ ] Finish Readme
